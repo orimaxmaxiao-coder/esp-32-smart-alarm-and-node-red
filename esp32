@@ -1,0 +1,392 @@
+/*****************************************************************************************
+ *  ESP32 多功能桌面温湿度报警器  –  中英双文注释版（chinese and english by xiao ma ）
+ *  ESP32 Multi-function Desktop Temp & Humidity Alarm  –  Bilingual Comments Edition
+ *
+ *  功能简述 / Brief：
+ *  1. 密码键盘解锁（6730613037+#）（Password unlock via keypad 6730613037 + #）
+ *  2. A键总开关；B键改阈值；C键翻转屏；D键静音（A=toggle, B=threshold, C=flip, D=mute）
+ *  3. 温度>阈值且系统=ON → LED亮，蜂鸣器响（静音时无声）（Temp>threshold & sys=ON → LED on, buzzer beeps (muted if mute flag)）
+ *  4. 全引脚外露，方便二次开发（All pins exposed for easy secondary development）
+ *  5. Wi-Fi 自动联网，OLED 实时显示东七区时间（HH:MM:SS DD/MM），同时把数据发到 MQTT（broker.hivemq.com）
+ *    /本地每2s刷新温湿度、光照、时间
+ *
+ *  编译环境 / Compile：Arduino IDE 或 PlatformIO  +  ESP32 板包
+ *****************************************************************************************
+ *  主题：
+ *    XiaoMa/ldr/raw_value
+ *    XiaoMa/ntp/time
+ *    XiaoMa/dht22/temp
+ *    XiaoMa/dht22/humi
+ *     XiaoMa/cmd/flip
+ *    XiaoMa/cmd/flip       → 翻转屏幕
+ *    XiaoMa/cmd/mute       → 静音/取消静音
+ *    XiaoMa/cmd/alarm      → 总开关
+ *    XiaoMa/cmd/threshold  → 设置报警温度阈值（0-99）
+ *****************************************************************************************/
+
+#include <WiFi.h>
+#include <PubSubClient.h>
+#include <Wire.h>
+#include "time.h"
+#include <Adafruit_GFX.h>
+#include <Adafruit_SSD1306.h>
+#include <DHT.h>
+#include <Keypad.h>
+
+// ======================= Wi-Fi / MQTT ===========================
+const char* WIFI_SSID   = "Wokwi-GUEST";
+const char* WIFI_PASS   = "";
+const char* MQTT_BROKER = "broker.hivemq.com";
+const int   MQTT_PORT   = 1883;
+
+const char* TOPIC_LDR   = "XiaoMa/ldr/raw_value";
+const char* TOPIC_TIME  = "XiaoMa/ntp/time";
+const char* TOPIC_TEMP  = "XiaoMa/dht22/temp";
+const char* TOPIC_HUMI  = "XiaoMa/dht22/humi";
+
+WiFiClient espClient;
+PubSubClient mqtt(espClient);
+
+// ======================= 传感器引脚 =============================
+#define LDR_PIN     36
+#define DHTPIN      25
+#define DHTTYPE     DHT22
+DHT dht(DHTPIN, DHTTYPE);
+
+// ======================= 声光报警 =============================
+#define LED_PIN   18
+#define BUZZ_PIN  19
+
+// ======================= OLED ================================
+#define SCREEN_W 128
+#define SCREEN_H 64
+#define OLED_RESET -1
+Adafruit_SSD1306 display(SCREEN_W, SCREEN_H, &Wire, OLED_RESET);
+
+// ======================= 4×4 键盘 ============================
+const byte ROWS = 4;
+const byte COLS = 4;
+char keys[ROWS][COLS] = {
+  {'1','2','3','A'},
+  {'4','5','6','B'},
+  {'7','8','9','C'},
+  {'*','0','#','D'}
+};
+byte rowPins[ROWS] = {32, 33, 27, 26};
+byte colPins[COLS] = {15, 14, 12, 13};
+Keypad keypad = Keypad(makeKeymap(keys), rowPins, colPins, ROWS, COLS);
+
+// ======================= 系统状态 ==============================
+const String PASSWORD = "6730613037";
+String inputBuffer = "";
+bool authPassed   = false;
+bool systemEnabled = false;
+bool settingTH   = false;
+bool muteOn      = false;
+bool flipOn      = false;
+int  alarmThreshold = 35;
+String thBuffer = "";
+
+// ======================= NTP ==================================
+const long  GMT_OFFSET_SEC  = 7 * 3600;
+const int   DAYLIGHT_OFFSET = 0;
+const char* NTP_SERVER = "pool.ntp.org";
+struct tm timeInfo;
+char      timeStr[20] = "No time sync";
+
+// ======================= 定时器 ===============================
+unsigned long tPrevDisp = 0;
+unsigned long tPrevMQTT = 0;
+const long    DISP_INTERVAL = 2000;
+const long    MQTT_INTERVAL = 5000;
+
+// -------------- 函数前置声明 --------------
+void showInputScreen();
+void handlePasswordInput(char key);
+void handleTHsetting(char key);
+void handleAuthenticatedKey(char key);
+void startTHset();
+void quickMsg(const char* title, const char* val);
+void updateLocalTime();
+void readAndDisplay();
+void publishAllMQTT();
+void mqttCallback(char* topic, byte* payload, unsigned int len);
+void ensureMQTT();
+
+// -------------------------------------------------------------------
+void setup() {
+  Serial.begin(115200);
+  pinMode(LED_PIN, OUTPUT);
+  pinMode(BUZZ_PIN, OUTPUT);
+  pinMode(LDR_PIN, INPUT);
+
+  dht.begin();
+  Wire.begin();
+  if (!display.begin(SSD1306_SWITCHCAPVCC, 0x3C)) {
+    Serial.println("SSD1306 alloc failed");
+    for (;;);
+  }
+  display.clearDisplay();
+  display.setTextSize(1);
+  display.setTextColor(WHITE);
+  showInputScreen();
+
+  WiFi.mode(WIFI_STA);
+  WiFi.begin(WIFI_SSID, WIFI_PASS);
+  configTime(GMT_OFFSET_SEC, DAYLIGHT_OFFSET, NTP_SERVER);
+  mqtt.setServer(MQTT_BROKER, MQTT_PORT);
+  mqtt.setCallback(mqttCallback);
+}
+
+// -------------------------------------------------------------------
+void loop() {
+  char key = keypad.getKey();
+  if (key) {
+    if (!authPassed) handlePasswordInput(key);
+    else if (settingTH) handleTHsetting(key);
+    else handleAuthenticatedKey(key);
+  }
+
+  if (authPassed && !settingTH) {
+    unsigned long now = millis();
+    if (now - tPrevDisp >= DISP_INTERVAL) {
+      tPrevDisp = now;
+      if (WiFi.status() != WL_CONNECTED) {
+        Serial.print(".");
+        return;
+      }
+      static bool once = false;
+      if (!once) {
+        once = true;
+        Serial.println("\nWiFi connected");
+        Serial.println(WiFi.localIP());
+      }
+      updateLocalTime();
+      readAndDisplay();
+    }
+    if (now - tPrevMQTT >= MQTT_INTERVAL) {
+      tPrevMQTT = now;
+      publishAllMQTT();
+    }
+  }
+
+  ensureMQTT();
+  mqtt.loop();
+}
+
+// ======================= MQTT 连接 & 订阅 ========================
+void ensureMQTT() {
+  while (!mqtt.connected()) {
+    String cid = "ESP32-XiaoMa-" + String(random(0xffff), HEX);
+    if (mqtt.connect(cid.c_str())) {
+      Serial.println("MQTT connected");
+      mqtt.subscribe("XiaoMa/cmd/flip");      //翻屏
+      mqtt.subscribe("XiaoMa/cmd/mute");      //静音
+      mqtt.subscribe("XiaoMa/cmd/alarm");     //总开关
+      mqtt.subscribe("XiaoMa/cmd/threshold"); //←新增：远程设阈值
+    } else {
+      Serial.print("MQTT fail rc=");
+      Serial.println(mqtt.state());
+      delay(2000);
+    }
+  }
+}
+
+// ======================= MQTT 接收回调 ===========================
+void mqttCallback(char* topic, byte* payload, unsigned int len) {
+  // 一键翻屏
+  if (strcmp(topic, "XiaoMa/cmd/flip") == 0) {
+    flipOn = !flipOn;
+    display.setRotation(flipOn ? 2 : 0);
+    quickMsg("Flip", flipOn ? "ON" : "OFF");
+  }
+  // 一键静音
+  if (strcmp(topic, "XiaoMa/cmd/mute") == 0) {
+    muteOn = !muteOn;
+    quickMsg("Mute", muteOn ? "ON" : "OFF");
+    if (muteOn) digitalWrite(BUZZ_PIN, LOW);
+  }
+  // 一键总开关
+  if (strcmp(topic, "XiaoMa/cmd/alarm") == 0) {
+    systemEnabled = !systemEnabled;
+    quickMsg("System", systemEnabled ? "ON" : "OFF");
+    if (!systemEnabled) {
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(BUZZ_PIN, LOW);
+    }
+  }
+  // 远程设置阈值（0-99）
+  if (strcmp(topic, "XiaoMa/cmd/threshold") == 0) {
+    int newTh = atoi((char*)payload);
+    if (newTh >= 0 && newTh <= 99) {
+      alarmThreshold = newTh;
+      quickMsg("Threshold", String(alarmThreshold).c_str());
+    }
+  }
+}
+
+// ======================= MQTT 上传 ===============================
+void publishAllMQTT() {
+  int   ldr = analogRead(LDR_PIN);
+  float t   = dht.readTemperature();
+  float h   = dht.readHumidity();
+  if (isnan(t) || isnan(h)) return;
+
+  char bufLDR[16];
+  char bufTime[32];
+  char bufTemp[16];
+  char bufHumi[16];
+
+  itoa(ldr, bufLDR, 10);
+  mqtt.publish(TOPIC_LDR, bufLDR);
+
+  strftime(bufTime, sizeof(bufTime), "%Y-%m-%d %H:%M:%S", &timeInfo);
+  mqtt.publish(TOPIC_TIME, bufTime);
+
+  sprintf(bufTemp, "%.2f", t);
+  mqtt.publish(TOPIC_TEMP, bufTemp);
+
+  sprintf(bufHumi, "%.2f", h);
+  mqtt.publish(TOPIC_HUMI, bufHumi);
+
+  Serial.printf("MQTT published: LDR=%s  Time=%s  Temp=%s\xB0C  Humi=%s%%\n",
+                bufLDR, bufTime, bufTemp, bufHumi);
+}
+
+// ======================= 键盘 & OLED 交互 ========================
+void showInputScreen() {
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Enter PIN:");
+  display.setCursor(0, 56);
+  display.print("*DEL  #OK");
+  display.display();
+}
+
+void handlePasswordInput(char key) {
+  if (key == '*') { inputBuffer = ""; showInputScreen(); return; }
+  if (key == '#') return;
+  inputBuffer += key;
+  display.setCursor(0, 16);
+  display.print(inputBuffer);
+  display.display();
+  if (inputBuffer.length() == PASSWORD.length()) {
+    if (inputBuffer == PASSWORD) {
+      authPassed = true;
+      systemEnabled = true;
+      quickMsg("Access granted","");
+    } else {
+      quickMsg("Wrong PIN","");
+      inputBuffer = "";
+      showInputScreen();
+    }
+  }
+}
+
+void handleAuthenticatedKey(char key) {
+  if (key == 'A') {
+    systemEnabled = !systemEnabled;
+    quickMsg("System", systemEnabled ? "ON" : "OFF");
+  } else if (key == 'B') {
+    startTHset();
+  } else if (key == 'C') {
+    flipOn = !flipOn;
+    display.setRotation(flipOn ? 2 : 0);
+    quickMsg("Flip", flipOn ? "ON" : "OFF");
+  } else if (key == 'D') {
+    muteOn = !muteOn;
+    quickMsg("Mute", muteOn ? "ON" : "OFF");
+  }
+}
+
+void startTHset() {
+  settingTH = true;
+  thBuffer = "";
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  display.print("Set threshold:");
+  display.setCursor(0, 16);
+  display.print(">");
+  display.display();
+}
+
+void handleTHsetting(char key) {
+  if (key == '*') { settingTH = false; return; }
+  if (key == '#') {
+    if (thBuffer.length() > 0) {
+      alarmThreshold = thBuffer.toInt();
+      if (alarmThreshold < 0 || alarmThreshold > 99) alarmThreshold = 35;
+    }
+    quickMsg("Saved", "");
+    settingTH = false;
+    return;
+  }
+  if (thBuffer.length() < 2) {
+    thBuffer += key;
+    display.setCursor(0, 16);
+    display.print("> ");
+    display.print(thBuffer);
+    display.display();
+  }
+}
+
+void quickMsg(const char* title, const char* val) {
+  display.clearDisplay();
+  display.setCursor(0, 24);
+  display.print(title);
+  if (val[0]) { display.print(':'); display.print(val); }
+  display.display();
+  delay(800);
+}
+
+// ======================= 数据采集 & 报警 ===========================
+void updateLocalTime() {
+  if (getLocalTime(&timeInfo, 10)) {
+    snprintf(timeStr, sizeof(timeStr), "%02d:%02d:%02d  %02d/%02d",
+             timeInfo.tm_hour, timeInfo.tm_min, timeInfo.tm_sec,
+             timeInfo.tm_mday, timeInfo.tm_mon + 1);
+  } else {
+    strcpy(timeStr, "No time sync");
+  }
+}
+
+void readAndDisplay() {
+  float h = dht.readHumidity();
+  float t = dht.readTemperature();
+  int   l = analogRead(LDR_PIN);
+
+  display.clearDisplay();
+  display.setCursor(0, 0);
+  if (isnan(h) || isnan(t)) {
+    display.println("DHT error!");
+  } else {
+    display.print("T:");
+    display.print(t);
+    display.print(" C  H:");
+    display.print(h);
+    display.println(" %");
+    display.setCursor(0, 16);
+    display.print("LDR:");
+    display.print(l);
+    display.print("  Th:");
+    display.println(alarmThreshold);
+    display.setCursor(0, 32);
+    display.print("Sys:");
+    display.print(systemEnabled ? "ON" : "OFF");
+    display.print("  Mute:");
+    display.println(muteOn ? "ON" : "OFF");
+
+    if (systemEnabled && t > alarmThreshold) {
+      digitalWrite(LED_PIN, HIGH);
+      if (!muteOn) digitalWrite(BUZZ_PIN, HIGH);
+      display.setCursor(0, 48);
+      display.print("HIGH TEMP!");
+    } else {
+      digitalWrite(LED_PIN, LOW);
+      digitalWrite(BUZZ_PIN, LOW);
+    }
+  }
+  display.setCursor(0, 56);
+  display.print(timeStr);
+  display.display();
+}
